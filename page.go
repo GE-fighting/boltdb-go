@@ -17,6 +17,12 @@ const (
 	KeepPage     = 0x8000 // 保留页面
 )
 
+// MaxCommitPages 定义了最大提交页面数为64。
+const MaxCommitPages = 64
+
+// maxWriterByteCount 定义了写入器的最大字节计数为0x80000000（2^31-1），这是系统能够处理的最大字节量。
+const maxWriterByteCount = 0x80000000
+
 // page 结构体表示数据库中的一个页面。
 type page struct {
 	header struct {
@@ -27,6 +33,15 @@ type page struct {
 		overflowPageCount int   // 溢出页面的数量
 	}
 	metadata []byte // 页面的元数据
+}
+
+// pageState 结构体定义了一个页面的状态
+// 其中包含两个字段：
+// head: 表示被回收的 freeDB 页面，或者在使用前的 NULL 值。
+// last: 表示最后使用的记录的 ID，如果 mf_pghead 为 false，则为 0。
+type pageState struct {
+	head int /* Reclaimed freeDB pages, or NULL before use*/
+	last int /* ID of last used record, or 0 if !mf_pghead*/
 }
 
 // nodeCount 返回页面中的节点数量。

@@ -29,3 +29,13 @@ func (n *node) setFlags(f int) {
 func (n *node) size() int {
 	return 0
 }
+
+// shrink 函数用于在删除子页面上的一个节点后，紧凑主页面。
+// 参数：
+//
+//	index int - 要删除的节点在子页面中的索引。
+//
+// 该函数没有返回值。
+func (n *node) shrink(index int) {
+
+}

@@ -50,3 +50,109 @@ type cursor struct {
 	page        []*page      // 页栈，用于记录游标当前位置的页信息
 	ki          []int        // 页索引栈，用于记录游标在各页中的索引位置
 }
+
+func (c *cursor) xkeep(pflags unsigned, all int) int {
+	return 0
+}
+
+func (c *cursor) spill(MDB_val *key, MDB_val *data) int {
+	return 0
+}
+
+func (c *cursor) page_touch() int {
+	return 0
+}
+
+func (c *cursor) search(key []byte) (*node, error) {
+	return nil, nil
+}
+
+func (c *cursor) pop() {
+
+}
+
+// push将指定的页面p添加到cursor的内部结构中。
+//
+// 参数:
+// p *page - 需要被添加到cursor中的页面指针。
+//
+// 返回值:
+// error - 如果添加过程中遇到错误，则返回非nil的error对象；否则返回nil。
+func (c *cursor) push(p *page) error {
+	return nil
+}
+
+func (c *cursor) searchRoot(key []byte, flags int) error {
+	return nil
+}
+func (c *cursor) searchLowest() error {
+	return nil
+}
+
+func (c *cursor) Del(flags int) error {
+	return nil
+}
+
+func (c *cursor) newPage(flags int, num int) ([]*page, error) {
+	return nil, nil
+}
+
+func (c *cursor) addNode(index int, key []byte, data []byte, pgno int, flags int) error {
+	return nil
+}
+func (c *cursor) deleteNode(ksize int) {
+
+}
+func (c *cursor) xcursor_init0() {
+
+}
+func (c *cursor) xcursor_init1(n *node) {
+
+}
+
+func (c *cursor) init(t *transaction, bucket *bucket, mx *xcursor) {
+
+}
+func (c *cursor) count() (int, error) {
+	return 0, nil
+}
+
+func (c *cursor) Close() {}
+
+func (c *cursor) Transaction() Transaction {
+	return nil
+}
+
+func (c *cursor) Bucket() Bucket {
+	return c.bucket
+}
+
+func (c *cursor) updateKey(key []byte) error {
+	return nil
+}
+
+func (c *cursor) moveNodeTo(dst *cursor) error {
+	return nil
+}
+
+func (c *cursor) mergePage(dst *cursor) error {
+	return nil
+}
+
+func (c *cursor) copyTo(dst *cursor) {
+
+}
+
+func (c *cursor) rebalance() error {
+	return nil
+}
+
+func (c *cursor) del0(leaf *node) error {
+	return nil
+}
+func (c *cursor) splitPage(newKey []byte, newData []byte, newpgno int, nflags int) error {
+	return nil
+}
+func (c *cursor) drop0(subs int) error {
+	return nil
+}
