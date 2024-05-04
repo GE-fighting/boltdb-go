@@ -42,21 +42,28 @@ type cursor struct {
 	xcursor     *xcursor     // 用于底层存储访问的游标
 	transaction *transaction // 关联的事务对象
 	bucketID    int          // 当前操作的Bucket ID
-	bucket      *bucket      // 当前操作的Bucket
-	bucketx     *bucketx     // 内部使用的Bucket扩展信息
-	bucketFlag  int          // Bucket标志位，用于标识Bucket状态
-	snum        int          // 页栈的数量，用于内部页跳转逻辑
-	top         int          // 页栈的顶部索引，标识当前所在的页层级
-	page        []*page      // 页栈，用于记录游标当前位置的页信息
-	ki          []int        // 页索引栈，用于记录游标在各页中的索引位置
+	bucket      *Bucket      // 当前操作的Bucket
+	//bucketx     *bucketx     // 内部使用的Bucket扩展信息
+	bucketFlag int     // Bucket标志位，用于标识Bucket状态
+	snum       int     // 页栈的数量，用于内部页跳转逻辑
+	top        int     // 页栈的顶部索引，标识当前所在的页层级
+	page       []*page // 页栈，用于记录游标当前位置的页信息
+	ki         []int   // 页索引栈，用于记录游标在各页中的索引位置
 }
 
-func (c *cursor) xkeep(pflags unsigned, all int) int {
-	return 0
+type xcursor struct {
+	cursor cursor
+	bucket *Bucket
+	//bucketx    *BucketX
+	bucketFlag int
 }
 
-func (c *cursor) spill(MDB_val *key, MDB_val *data) int {
-	return 0
+func (c *cursor) xkeep(pflags int, all int) error {
+	return nil
+}
+
+func (c *cursor) spill(key []byte, data []byte) error {
+	return nil
 }
 
 func (c *cursor) page_touch() int {
@@ -110,7 +117,7 @@ func (c *cursor) xcursor_init1(n *node) {
 
 }
 
-func (c *cursor) init(t *transaction, bucket *bucket, mx *xcursor) {
+func (c *cursor) init(t *transaction, bucket *Bucket, mx *xcursor) {
 
 }
 func (c *cursor) count() (int, error) {
@@ -123,7 +130,7 @@ func (c *cursor) Transaction() Transaction {
 	return nil
 }
 
-func (c *cursor) Bucket() Bucket {
+func (c *cursor) Bucket() *Bucket {
 	return c.bucket
 }
 

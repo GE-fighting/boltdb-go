@@ -1,7 +1,7 @@
 package boltdb_go
 
 // stat 结构体用于统计 B+树的各个组成部分的数量和大小。
-type stat struct {
+type Stat struct {
 	PageSize          int // 每页的大小
 	Depth             int // B+树的深度
 	BranchPageCount   int // 分支页的数量

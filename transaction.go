@@ -12,7 +12,7 @@ type transaction struct {
 	// flags 存储与事务相关的一些标志位信息。
 	flags int
 	// db 指向当前事务所属的Boltdb数据库实例。
-	db *db
+	db *DB
 	// parent 指向当前事务的父级事务（如果存在）。
 	parent *transaction
 	// child 指向当前事务的子级事务（如果存在）。
@@ -28,7 +28,7 @@ type transaction struct {
 	// reader 提供对数据库底层数据的读取访问。
 	reader *reader
 	// buckets 存储当前事务涉及的所有桶的引用。
-	buckets []*bucket
+	buckets []*Bucket
 	// bucketFlags 存储与各个桶关联的标志位信息。
 	bucketFlags []int
 	// TODO: 待实现bucketxs字段，用于存储与事务关联的扩展桶列表。
@@ -123,7 +123,7 @@ func (t *transaction) Renew() {
 //
 // 返回值:
 // DB - 代表当前事务所关联的数据库对象。
-func (t *transaction) DB() DB {
+func (t *transaction) DB() *DB {
 	return t.db
 }
 
@@ -171,22 +171,22 @@ func (t *transaction) Get(bucket Bucket, key []byte) ([]byte, error) {
 	return nil, nil
 }
 
-func (t *transaction) Cursor(b bucket) error {
+func (t *transaction) Cursor(b Bucket) error {
 	return nil
 }
 
-func (t *transaction) Delete(b *bucket, key []byte, data []byte) error {
+func (t *transaction) Delete(b *Bucket, key []byte, data []byte) error {
 	return nil
 }
 func (t *transaction) Put(b Bucket, key []byte, data []byte, flags int) error {
 	return nil
 }
 
-func (t *transaction) Bucket(name string, flags int) (Bucket, error) {
+func (t *transaction) Bucket(name string, flags int) (*Bucket, error) {
 	return nil, nil
 }
 
-func (t *transaction) Stat(b Bucket) *stat {
+func (t *transaction) Stat(b Bucket) *Stat {
 	return nil
 }
 
@@ -194,6 +194,6 @@ func (t *transaction) BucketFlags(b Bucket) (int, error) {
 	return 0, nil
 }
 
-func (t *transaction) Drop(b bucket, del int) error {
+func (t *transaction) Drop(b Bucket, del int) error {
 	return nil
 }

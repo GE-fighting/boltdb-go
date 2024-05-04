@@ -3,6 +3,8 @@ package boltdb_go
 import (
 	"os"
 	"sync"
+	"syscall"
+	"unsafe"
 )
 
 // 定义DB相关的选项常量。
@@ -19,50 +21,175 @@ const (
 	IntegerDupKey
 )
 
-// DB 接口定义了Boltdb数据库的基本操作。
-type DB interface {
-	// （待补充具体的DB接口方法声明）
-}
+var DatabaseAlreadyOpenError = &Error{"database already open", nil}
 
-// db 结构体实现了DB接口，是Boltdb数据库的具体实现。
-type db struct {
+// DB 结构体实现了DB接口，是Boltdb数据库的具体实现。
+type DB struct {
 	sync.Mutex
-	file             os.File
-	flags            int
-	pageSize         int
-	osPageSize       int
-	readers          []*reader
-	buckets          []*bucket
-	xbuckets         []*bucketx /**< array of static DB info */
-	bucketFlags      []int      /**< array of flags from MDB_db.md_flags */
-	path             string
-	mmap             []byte
-	mmapSize         int /**< size of the data memory map */
-	size             int /**< current file size */
-	meta1            []byte
-	meta2            []byte
-	pbuf             []byte
-	transaction      *transaction /**< current write transaction */
-	maxPageNumber    int          /**< me_mapsize / me_psize */
-	pageState        pageStage    /**< state of old pages from freeDB */
-	dpages           []*page      /**< list of malloc'd blocks for re-use */
-	freePageNumbers  []int        /** IDL of pages that became unused in a write txn */
-	dirtyPageNumbers []int        /** ID2L of pages written during a write txn. Length MDB_IDL_UM_SIZE. */
-	maxFreeOnePage   int          /** Max number of freelist items that can fit in a single overflow page */
-	maxNodeSize      int          /** Max size of a node on a page */
-	maxKeySize       int          /**< max size of a key */
+	opened   bool
+	file     *os.File
+	metafile *os.File
+	data     []byte
+	buf      []byte
+	m0       *meta
+	m1       *meta
+	pageSize int
+	readers  []*reader
+	buckets  []*Bucket
+	//xbuckets       []*bucketx /**< array of static DB info */
+	bucketFlags     []int /**< array of flags from MDB_db.md_flags */
+	path            string
+	mmapSize        int /**< size of the data memory map */
+	size            int /**< current file size */
+	pbuf            []byte
+	transaction     *transaction /**< current write transaction */
+	maxPageNumber   int          /**< me_mapsize / me_psize */
+	pageState       pageState    /**< state of old pages from freeDB */
+	dpages          []*page      /**< list of malloc'd blocks for re-use */
+	freePages       []int        /** IDL of pages that became unused in a write txn */
+	dirtyPages      []int        /** ID2L of pages written during a write txn. Length MDB_IDL_UM_SIZE. */
+	maxFreeOnePage  int          /** Max number of freelist items that can fit in a single overflow page */
+	maxPageDataSize int
+	maxNodeSize     int /** Max size of a node on a page */
+	maxKeySize      int /**< max size of a key */
 }
 
 // NewDB 创建并返回一个新的Boltdb数据库实例。
-func NewDB() DB {
-	return &db{}
+func NewDB() *DB {
+	return &DB{}
 }
 
-func (db *db) Path() string {
-	return db.path
+func (db *DB) Open(path string, mode os.FileMode) error {
+	var err error
+	db.Lock()
+	defer db.Unlock()
+	// 检查数据库是否已经打开
+	// 如果数据库已经打开，则返回一个DatabaseAlreadyOpenError错误。
+	if db.opened {
+		return DatabaseAlreadyOpenError
+	}
+	db.path = path
+	if db.file, err = os.OpenFile(db.path, os.O_RDWR|os.O_CREATE, mode); err != nil {
+		db.Close()
+		return err
+	}
+	if db.metafile, err = os.OpenFile(db.path, os.O_RDWR|os.O_SYNC, mode); err != nil {
+		db.Close()
+		return err
+	}
+
+	var m, m0, m1 *meta
+	var buf [pageHeaderSize + int(unsafe.Sizeof(meta{}))]byte
+	if _, err = db.file.ReadAt(buf[:], 0); err == nil {
+		if m0, _ = db.page(buf[:], 0).meta(); m0 != nil {
+			db.pageSize = int(m0.free.pad)
+		}
+	}
+	if _, err = db.file.ReadAt(buf[:], int64(db.pageSize)); err == nil {
+		m1, _ = db.page(buf[:], 0).meta()
+	}
+
+	if m0 != nil && m1 != nil {
+		if m0.txnid > m1.txnid {
+			m = m0
+		} else {
+			m = m1
+		}
+	}
+	// Initialize the page size for new environments.
+	if m == nil {
+		if err = db.init(); err != nil {
+			db.Close()
+		}
+	}
+	// Initialize db fields.
+	db.buf = make([]byte, db.pageSize)
+	db.maxPageDataSize = ((db.pageSize - pageHeaderSize) / int(unsafe.Sizeof(pgno(0)))) - 1
+	db.maxNodeSize = (((db.pageSize - pageHeaderSize) / minKeyCount) & -2) - int(unsafe.Sizeof(indx(0)))
+	if err = db.mmap(); err != nil {
+		db.Close()
+		return err
+	}
+	db.buf = make([]byte, db.pageSize)
+	db.opened = true
+	return nil
 }
 
-func (db *db) freePage(p *page) {
+// mmap函数用于将数据库文件映射到内存中。
+// 它首先检查文件大小是否足够，然后尝试将文件映射到内存，并初始化相关的页面数据。
+// 参数:
+// - db *DB: 表示数据库的实例，包含文件句柄和页面大小等信息。
+// 返回值:
+// - error: 如果映射过程中遇到错误，则返回错误信息；否则返回nil。
+func (db *DB) mmap() error {
+	var err error
+	var size int
+
+	// 检查文件大小是否足够。
+	if info, err := os.Stat(db.file.Name()); err != nil {
+		return err // 无法获取文件状态时返回错误。
+	} else if info.Size() < int64(db.pageSize*2) {
+		return &Error{"file size is too small", nil} // 文件大小太小，不满足要求。
+	} else {
+		size = int(info.Size()) // 文件大小满足要求，记录大小。
+	}
+
+	// 尝试将文件映射到内存。
+	if db.data, err = syscall.Mmap(int(db.file.Fd()), 0, size, syscall.PROT_READ, syscall.MAP_SHARED); err != nil {
+		return err // 映射文件到内存失败。
+	}
+
+	// 初始化meta0和meta1页面。
+	if db.m0, err = db.page(db.data, 0).meta(); err != nil {
+		return &Error{"meta0 error", err} // 初始化meta0页面失败。
+	}
+	if db.m1, err = db.page(db.data, 1).meta(); err != nil {
+		return &Error{"meta1 error", err} // 初始化meta1页面失败。
+	}
+
+	return nil // 映射和初始化成功，返回nil。
+}
+
+// init creates a new database file and initializes its meta pages.
+
+func (db *DB) init() error {
+	// 将页面大小设置为操作系统页面大小，但限制在最大允许值之内。
+	db.pageSize = os.Getpagesize()
+	if db.pageSize > maxPageSize {
+		db.pageSize = maxPageSize
+	}
+
+	// 分配一个缓冲区以容纳两个页面的数据。
+	buf := make([]byte, db.pageSize*2)
+
+	// 初始化元数据页面，设置它们的ID和元数据信息。
+	for i := 0; i < 2; i++ {
+		p := db.page(buf[:], i) // 使用缓冲区和页面索引创建页面实例。
+		p.id = pgno(i)          // 设置页面ID。
+		p.initMeta(db.pageSize) // 使用配置的页面大小初始化页面上的元数据。
+	}
+
+	// 将初始化后的元数据页面写入元数据文件的起始位置。
+	if _, err := db.metafile.WriteAt(buf, 0); err != nil {
+		return err // 写入失败时返回错误。
+	}
+
+	return nil // 初始化成功则返回nil。
+}
+
+func (db *DB) close() {
+	//TODO
+}
+
+// page 根据当前页面大小，从给定字节数组中检索页面引用。
+func (db *DB) page(b []byte, id int) *page {
+	// 计算id对应的页面在b中的起始位置
+	offset := id * db.pageSize
+	// 将计算得到的偏移量位置视为*page类型指针返回，这里假设b[offset:offset+db.pageSize]区域存放的是一个page结构体
+	return (*page)(unsafe.Pointer(&b[offset]))
+}
+
+func (db *DB) freePage(p *page) {
 	/*
 		mp->mp_next = env->me_dpages;
 		VGMEMP_FREE(env, mp);
@@ -70,7 +197,7 @@ func (db *db) freePage(p *page) {
 	*/
 }
 
-func (db *db) freeDirtyPage(p *page) {
+func (db *DB) freeDirtyPage(p *page) {
 	/*
 		if (!IS_OVERFLOW(dp) || dp->mp_pages == 1) {
 			mdb_page_free(env, dp);
@@ -82,7 +209,7 @@ func (db *db) freeDirtyPage(p *page) {
 	*/
 }
 
-func (db *db) freeAllDirtyPages(p *page) {
+func (db *DB) freeAllDirtyPages(p *page) {
 	/*
 		MDB_env *env = txn->mt_env;
 		MDB_ID2L dl = txn->mt_u.dirty_list;
@@ -95,7 +222,7 @@ func (db *db) freeAllDirtyPages(p *page) {
 	*/
 }
 
-func (db *db) sync(force bool) error {
+func (db *DB) sync(force bool) error {
 	/*
 			int rc = 0;
 			if (force || !F_ISSET(env->me_flags, MDB_NOSYNC)) {
@@ -118,7 +245,7 @@ func (db *db) sync(force bool) error {
 	return nil
 }
 
-func (db *db) Transaction(parent *transaction, flags int) (*transaction, error) {
+func (db *DB) Transaction(parent *transaction, flags int) (*transaction, error) {
 	/*
 		MDB_txn *txn;
 		MDB_ntxn *ntxn;
@@ -212,143 +339,17 @@ func (db *db) Transaction(parent *transaction, flags int) (*transaction, error) 
 
 		return rc;
 	*/
-	return nil
+	return nil, nil
 }
 
-// Read the environment parameters of a DB environment before
-// mapping it into memory.
-// @param[in] env the environment handle
-// @param[out] meta address of where to store the meta information
-// @return 0 on success, non-zero on failure.
-func (db *db) readHeader(meta *meta) error {
-	/*
-			MDB_metabuf	pbuf;
-			MDB_page	*p;
-			MDB_meta	*m;
-			int			i, rc, off;
-			enum { Size = sizeof(pbuf) };
-
-			// We don't know the page size yet, so use a minimum value.
-			// Read both meta pages so we can use the latest one.
-
-			for (i=off=0; i<2; i++, off = meta->mm_psize) {
-		#ifdef _WIN32
-				DWORD len;
-				OVERLAPPED ov;
-				memset(&ov, 0, sizeof(ov));
-				ov.Offset = off;
-				rc = ReadFile(env->me_fd, &pbuf, Size, &len, &ov) ? (int)len : -1;
-				if (rc == -1 && ErrCode() == ERROR_HANDLE_EOF)
-					rc = 0;
-		#else
-				rc = pread(env->me_fd, &pbuf, Size, off);
-		#endif
-				if (rc != Size) {
-					if (rc == 0 && off == 0)
-						return ENOENT;
-					rc = rc < 0 ? (int) ErrCode() : MDB_INVALID;
-					DPRINTF(("read: %s", mdb_strerror(rc)));
-					return rc;
-				}
-
-				p = (MDB_page *)&pbuf;
-
-				if (!F_ISSET(p->mp_flags, P_META)) {
-					DPRINTF(("page %"Z"u not a meta page", p->mp_pgno));
-					return MDB_INVALID;
-				}
-
-				m = METADATA(p);
-				if (m->mm_magic != MDB_MAGIC) {
-					DPUTS("meta has invalid magic");
-					return MDB_INVALID;
-				}
-
-				if (m->mm_version != MDB_DATA_VERSION) {
-					DPRINTF(("database is version %u, expected version %u",
-						m->mm_version, MDB_DATA_VERSION));
-					return MDB_VERSION_MISMATCH;
-				}
-
-				if (off == 0 || m->mm_txnid > meta->mm_txnid)
-					*meta = *m;
-			}
-			return 0;
-	*/
-	return nil
-}
-
-// Write the environment parameters of a freshly created DB environment.
-// @param[in] env the environment handle
-// @param[out] meta address of where to store the meta information
-// @return 0 on success, non-zero on failure.
-func (db *db) initMeta(meta *meta) error {
-	/*
-			MDB_page *p, *q;
-			int rc;
-			unsigned int	 psize;
-		#ifdef _WIN32
-			DWORD len;
-			OVERLAPPED ov;
-			memset(&ov, 0, sizeof(ov));
-		#define DO_PWRITE(rc, fd, ptr, size, len, pos)	do { \
-			ov.Offset = pos;	\
-			rc = WriteFile(fd, ptr, size, &len, &ov);	} while(0)
-		#else
-			int len;
-		#define DO_PWRITE(rc, fd, ptr, size, len, pos)	do { \
-			len = pwrite(fd, ptr, size, pos);	\
-			rc = (len >= 0); } while(0)
-		#endif
-
-			DPUTS("writing new meta page");
-
-			psize = env->me_psize;
-
-			meta->mm_magic = MDB_MAGIC;
-			meta->mm_version = MDB_DATA_VERSION;
-			meta->mm_mapsize = env->me_mapsize;
-			meta->mm_psize = psize;
-			meta->mm_last_pg = 1;
-			meta->mm_flags = env->me_flags & 0xffff;
-			meta->mm_flags |= MDB_INTEGERKEY;
-			meta->mm_dbs[0].md_root = P_INVALID;
-			meta->mm_dbs[1].md_root = P_INVALID;
-
-			p = calloc(2, psize);
-			p->mp_pgno = 0;
-			p->mp_flags = P_META;
-			*(MDB_meta *)METADATA(p) = *meta;
-
-			q = (MDB_page *)((char *)p + psize);
-			q->mp_pgno = 1;
-			q->mp_flags = P_META;
-			*(MDB_meta *)METADATA(q) = *meta;
-
-			DO_PWRITE(rc, env->me_fd, p, psize * 2, len, 0);
-			if (!rc)
-				rc = ErrCode();
-			else if ((unsigned) len == psize * 2)
-				rc = MDB_SUCCESS;
-			else
-				rc = ENOSPC;
-			free(p);
-			return rc;
-	*/
-	return nil
-}
-
-// Check both meta pages to see which one is newer.
-// @param[in] env the environment handle
-// @return meta toggle (0 or 1).
-func (db *db) pickMeta() int {
+func (db *DB) pickMeta() int {
 	/*
 		return (env->me_metas[0]->mm_txnid < env->me_metas[1]->mm_txnid);
 	*/
 	return 0
 }
 
-func (db *db) Create() error {
+func (db *DB) Create() error {
 	/*
 			MDB_env *e;
 
@@ -374,81 +375,7 @@ func (db *db) Create() error {
 	return nil
 }
 
-// int mdb_env_map(MDB_env *env, void *addr, int newsize)
-func (db *db) openMmap(newsize int) {
-	/*
-			MDB_page *p;
-			unsigned int flags = env->me_flags;
-		#ifdef _WIN32
-			int rc;
-			HANDLE mh;
-			LONG sizelo, sizehi;
-			sizelo = env->me_mapsize & 0xffffffff;
-			sizehi = env->me_mapsize >> 16 >> 16; // only needed on Win64
-
-			// Windows won't create mappings for zero length files.
-			// Just allocate the maxsize right now.
-			if (newsize) {
-				if (SetFilePointer(env->me_fd, sizelo, &sizehi, 0) != (DWORD)sizelo
-					|| !SetEndOfFile(env->me_fd)
-					|| SetFilePointer(env->me_fd, 0, NULL, 0) != 0)
-					return ErrCode();
-			}
-			mh = CreateFileMapping(env->me_fd, NULL, flags & MDB_WRITEMAP ?
-				PAGE_READWRITE : PAGE_READONLY,
-				sizehi, sizelo, NULL);
-			if (!mh)
-				return ErrCode();
-			env->me_map = MapViewOfFileEx(mh, flags & MDB_WRITEMAP ?
-				FILE_MAP_WRITE : FILE_MAP_READ,
-				0, 0, env->me_mapsize, addr);
-			rc = env->me_map ? 0 : ErrCode();
-			CloseHandle(mh);
-			if (rc)
-				return rc;
-		#else
-			int prot = PROT_READ;
-			if (flags & MDB_WRITEMAP) {
-				prot |= PROT_WRITE;
-				if (ftruncate(env->me_fd, env->me_mapsize) < 0)
-					return ErrCode();
-			}
-			env->me_map = mmap(addr, env->me_mapsize, prot, MAP_SHARED,
-				env->me_fd, 0);
-			if (env->me_map == MAP_FAILED) {
-				env->me_map = NULL;
-				return ErrCode();
-			}
-
-			if (flags & MDB_NORDAHEAD) {
-				// Turn off readahead. It's harmful when the DB is larger than RAM.
-		#ifdef MADV_RANDOM
-				madvise(env->me_map, env->me_mapsize, MADV_RANDOM);
-		#else
-		#ifdef POSIX_MADV_RANDOM
-				posix_madvise(env->me_map, env->me_mapsize, POSIX_MADV_RANDOM);
-		#endif // POSIX_MADV_RANDOM
-		#endif // MADV_RANDOM
-			}
-		#endif // _WIN32
-
-			// Can happen because the address argument to mmap() is just a
-			// hint.  mmap() can pick another, e.g. if the range is in use.
-			// The MAP_FIXED flag would prevent that, but then mmap could
-			// instead unmap existing pages to make room for the new map.
-			if (addr && env->me_map != addr)
-				return EBUSY;	// TODO: Make a new MDB_* error code?
-
-			p = (MDB_page *)env->me_map;
-			env->me_metas[0] = METADATA(p);
-			env->me_metas[1] = (MDB_meta *)((char *)env->me_metas[0] + env->me_psize);
-
-			return MDB_SUCCESS;
-	*/
-	return nil
-}
-
-func (db *db) setMapSize(size int) error {
+func (db *DB) setMapSize(size int) error {
 	/*
 		// If env is already open, caller is responsible for making
 		// sure there are no active txns.
@@ -481,7 +408,7 @@ func (db *db) setMapSize(size int) error {
 	return nil
 }
 
-func (db *db) setMaxBucketCount(count int) error {
+func (db *DB) setMaxBucketCount(count int) error {
 	/*
 		if (env->me_map)
 			return EINVAL;
@@ -491,16 +418,17 @@ func (db *db) setMaxBucketCount(count int) error {
 	return nil
 }
 
-func (db *db) setMaxReaderCount(count int) error {
+func (db *DB) setMaxReaderCount(count int) error {
 	/*
 		if (env->me_map || readers < 1)
 			return EINVAL;
 		env->me_maxreaders = readers;
 		return MDB_SUCCESS;
 	*/
+	return nil
 }
 
-func (db *db) getMaxReaderCount(count int) (int, error) {
+func (db *DB) getMaxReaderCount(count int) (int, error) {
 	/*
 		if (!env || !readers)
 			return EINVAL;
@@ -510,305 +438,11 @@ func (db *db) getMaxReaderCount(count int) (int, error) {
 	return 0, nil
 }
 
-// Further setup required for opening an MDB environment
-func (db *db) open() error {
-	/*
-			unsigned int flags = env->me_flags;
-			int i, newenv = 0, rc;
-			MDB_meta meta;
+func (db *DB) close0(excl int) {
 
-		#ifdef _WIN32
-			// See if we should use QueryLimited
-			rc = GetVersion();
-			if ((rc & 0xff) > 5)
-				env->me_pidquery = MDB_PROCESS_QUERY_LIMITED_INFORMATION;
-			else
-				env->me_pidquery = PROCESS_QUERY_INFORMATION;
-		#endif // _WIN32
-
-			memset(&meta, 0, sizeof(meta));
-
-			if ((i = mdb_env_read_header(env, &meta)) != 0) {
-				if (i != ENOENT)
-					return i;
-				DPUTS("new mdbenv");
-				newenv = 1;
-				env->me_psize = env->me_os_psize;
-				if (env->me_psize > MAX_PAGESIZE)
-					env->me_psize = MAX_PAGESIZE;
-			} else {
-				env->me_psize = meta.mm_psize;
-			}
-
-			// Was a mapsize configured?
-			if (!env->me_mapsize) {
-				// If this is a new environment, take the default,
-				// else use the size recorded in the existing env.
-				env->me_mapsize = newenv ? DEFAULT_MAPSIZE : meta.mm_mapsize;
-			} else if (env->me_mapsize < meta.mm_mapsize) {
-				// If the configured size is smaller, make sure it's
-				// still big enough. Silently round up to minimum if not.
-				size_t minsize = (meta.mm_last_pg + 1) * meta.mm_psize;
-				if (env->me_mapsize < minsize)
-					env->me_mapsize = minsize;
-			}
-
-			rc = mdb_env_map(env, meta.mm_address, newenv);
-			if (rc)
-				return rc;
-
-			if (newenv) {
-				if (flags & MDB_FIXEDMAP)
-					meta.mm_address = env->me_map;
-				i = mdb_env_init_meta(env, &meta);
-				if (i != MDB_SUCCESS) {
-					return i;
-				}
-			}
-
-			env->me_maxfree_1pg = (env->me_psize - PAGEHDRSZ) / sizeof(pgno_t) - 1;
-			env->me_nodemax = (((env->me_psize - PAGEHDRSZ) / MDB_MINKEYS) & -2)
-				- sizeof(indx_t);
-		#if !(MDB_MAXKEYSIZE)
-			env->me_maxkey = env->me_nodemax - (NODESIZE + sizeof(MDB_db));
-		#endif
-			env->me_maxpg = env->me_mapsize / env->me_psize;
-
-		#if MDB_DEBUG
-			{
-				int toggle = mdb_env_pick_meta(env);
-				MDB_db *db = &env->me_metas[toggle]->mm_dbs[MAIN_DBI];
-
-				DPRINTF(("opened database version %u, pagesize %u",
-					env->me_metas[0]->mm_version, env->me_psize));
-				DPRINTF(("using meta page %d",    toggle));
-				DPRINTF(("depth: %u",             db->md_depth));
-				DPRINTF(("entries: %"Z"u",        db->md_entries));
-				DPRINTF(("branch pages: %"Z"u",   db->md_branch_pages));
-				DPRINTF(("leaf pages: %"Z"u",     db->md_leaf_pages));
-				DPRINTF(("overflow pages: %"Z"u", db->md_overflow_pages));
-				DPRINTF(("root: %"Z"u",           db->md_root));
-			}
-		#endif
-
-			return MDB_SUCCESS;
-	*/
-	return nil
 }
 
-func (db *db) Open(path string, flags int, mode uint) error {
-	/*
-			int		oflags, rc, len, excl = -1;
-			char *lpath, *dpath;
-
-			if (env->me_fd!=INVALID_HANDLE_VALUE || (flags & ~(CHANGEABLE|CHANGELESS)))
-				return EINVAL;
-
-			len = strlen(path);
-			if (flags & MDB_NOSUBDIR) {
-				rc = len + sizeof(LOCKSUFF) + len + 1;
-			} else {
-				rc = len + sizeof(LOCKNAME) + len + sizeof(DATANAME);
-			}
-			lpath = malloc(rc);
-			if (!lpath)
-				return ENOMEM;
-			if (flags & MDB_NOSUBDIR) {
-				dpath = lpath + len + sizeof(LOCKSUFF);
-				sprintf(lpath, "%s" LOCKSUFF, path);
-				strcpy(dpath, path);
-			} else {
-				dpath = lpath + len + sizeof(LOCKNAME);
-				sprintf(lpath, "%s" LOCKNAME, path);
-				sprintf(dpath, "%s" DATANAME, path);
-			}
-
-			rc = MDB_SUCCESS;
-			flags |= env->me_flags;
-			if (flags & MDB_RDONLY) {
-				// silently ignore WRITEMAP when we're only getting read access
-				flags &= ~MDB_WRITEMAP;
-			} else {
-				if (!((env->me_free_pgs = mdb_midl_alloc(MDB_IDL_UM_MAX)) &&
-					  (env->me_dirty_list = calloc(MDB_IDL_UM_SIZE, sizeof(MDB_ID2)))))
-					rc = ENOMEM;
-			}
-			env->me_flags = flags |= MDB_ENV_ACTIVE;
-			if (rc)
-				goto leave;
-
-			env->me_path = strdup(path);
-			env->me_dbxs = calloc(env->me_maxdbs, sizeof(MDB_dbx));
-			env->me_dbflags = calloc(env->me_maxdbs, sizeof(uint16_t));
-			if (!(env->me_dbxs && env->me_path && env->me_dbflags)) {
-				rc = ENOMEM;
-				goto leave;
-			}
-
-			// For RDONLY, get lockfile after we know datafile exists
-			if (!(flags & (MDB_RDONLY|MDB_NOLOCK))) {
-				rc = mdb_env_setup_locks(env, lpath, mode, &excl);
-				if (rc)
-					goto leave;
-			}
-
-		#ifdef _WIN32
-			if (F_ISSET(flags, MDB_RDONLY)) {
-				oflags = GENERIC_READ;
-				len = OPEN_EXISTING;
-			} else {
-				oflags = GENERIC_READ|GENERIC_WRITE;
-				len = OPEN_ALWAYS;
-			}
-			mode = FILE_ATTRIBUTE_NORMAL;
-			env->me_fd = CreateFile(dpath, oflags, FILE_SHARE_READ|FILE_SHARE_WRITE,
-				NULL, len, mode, NULL);
-		#else
-			if (F_ISSET(flags, MDB_RDONLY))
-				oflags = O_RDONLY;
-			else
-				oflags = O_RDWR | O_CREAT;
-
-			env->me_fd = open(dpath, oflags, mode);
-		#endif
-			if (env->me_fd == INVALID_HANDLE_VALUE) {
-				rc = ErrCode();
-				goto leave;
-			}
-
-			if ((flags & (MDB_RDONLY|MDB_NOLOCK)) == MDB_RDONLY) {
-				rc = mdb_env_setup_locks(env, lpath, mode, &excl);
-				if (rc)
-					goto leave;
-			}
-
-			if ((rc = mdb_env_open2(env)) == MDB_SUCCESS) {
-				if (flags & (MDB_RDONLY|MDB_WRITEMAP)) {
-					env->me_mfd = env->me_fd;
-				} else {
-					// Synchronous fd for meta writes. Needed even with
-					// MDB_NOSYNC/MDB_NOMETASYNC, in case these get reset.
-		#ifdef _WIN32
-					len = OPEN_EXISTING;
-					env->me_mfd = CreateFile(dpath, oflags,
-						FILE_SHARE_READ|FILE_SHARE_WRITE, NULL, len,
-						mode | FILE_FLAG_WRITE_THROUGH, NULL);
-		#else
-					oflags &= ~O_CREAT;
-					env->me_mfd = open(dpath, oflags | MDB_DSYNC, mode);
-		#endif
-					if (env->me_mfd == INVALID_HANDLE_VALUE) {
-						rc = ErrCode();
-						goto leave;
-					}
-				}
-				DPRINTF(("opened dbenv %p", (void *) env));
-				if (excl > 0) {
-					rc = mdb_env_share_locks(env, &excl);
-					if (rc)
-						goto leave;
-				}
-				if (!((flags & MDB_RDONLY) ||
-					  (env->me_pbuf = calloc(1, env->me_psize))))
-					rc = ENOMEM;
-			}
-
-		leave:
-			if (rc) {
-				mdb_env_close0(env, excl);
-			}
-			free(lpath);
-			return rc;
-	*/
-	return nil
-}
-
-// Destroy resources from mdb_env_open(), clear our readers & DBIs
-func (db *db) close0(excl) {
-	/*
-			int i;
-
-			if (!(env->me_flags & MDB_ENV_ACTIVE))
-				return;
-
-			// Doing this here since me_dbxs may not exist during mdb_env_close
-			for (i = env->me_maxdbs; --i > MAIN_DBI; )
-				free(env->me_dbxs[i].md_name.mv_data);
-
-			free(env->me_pbuf);
-			free(env->me_dbflags);
-			free(env->me_dbxs);
-			free(env->me_path);
-			free(env->me_dirty_list);
-			mdb_midl_free(env->me_free_pgs);
-
-			if (env->me_flags & MDB_ENV_TXKEY) {
-				pthread_key_delete(env->me_txkey);
-		#ifdef _WIN32
-				// Delete our key from the global list
-				for (i=0; i<mdb_tls_nkeys; i++)
-					if (mdb_tls_keys[i] == env->me_txkey) {
-						mdb_tls_keys[i] = mdb_tls_keys[mdb_tls_nkeys-1];
-						mdb_tls_nkeys--;
-						break;
-					}
-		#endif
-			}
-
-			if (env->me_map) {
-				munmap(env->me_map, env->me_mapsize);
-			}
-			if (env->me_mfd != env->me_fd && env->me_mfd != INVALID_HANDLE_VALUE)
-				(void) close(env->me_mfd);
-			if (env->me_fd != INVALID_HANDLE_VALUE)
-				(void) close(env->me_fd);
-			if (env->me_txns) {
-				MDB_PID_T pid = env->me_pid;
-				// Clearing readers is done in this function because
-				// me_txkey with its destructor must be disabled first.
-				for (i = env->me_numreaders; --i >= 0; )
-					if (env->me_txns->mti_readers[i].mr_pid == pid)
-						env->me_txns->mti_readers[i].mr_pid = 0;
-		#ifdef _WIN32
-				if (env->me_rmutex) {
-					CloseHandle(env->me_rmutex);
-					if (env->me_wmutex) CloseHandle(env->me_wmutex);
-				}
-				// Windows automatically destroys the mutexes when
-				// the last handle closes.
-		#elif defined(MDB_USE_POSIX_SEM)
-				if (env->me_rmutex != SEM_FAILED) {
-					sem_close(env->me_rmutex);
-					if (env->me_wmutex != SEM_FAILED)
-						sem_close(env->me_wmutex);
-					// If we have the filelock:  If we are the
-					// only remaining user, clean up semaphores.
-					if (excl == 0)
-						mdb_env_excl_lock(env, &excl);
-					if (excl > 0) {
-						sem_unlink(env->me_txns->mti_rmname);
-						sem_unlink(env->me_txns->mti_wmname);
-					}
-				}
-		#endif
-				munmap((void *)env->me_txns, (env->me_maxreaders-1)*sizeof(MDB_reader)+sizeof(MDB_txninfo));
-			}
-			if (env->me_lfd != INVALID_HANDLE_VALUE) {
-		#ifdef _WIN32
-				if (excl >= 0) {
-					// Unlock the lockfile.  Windows would have unlocked it
-					// after closing anyway, but not necessarily at once.
-					UnlockFile(env->me_lfd, 0, 0, 1, 0);
-				}
-		#endif
-				(void) close(env->me_lfd);
-			}
-
-			env->me_flags &= ~(MDB_ENV_ACTIVE|MDB_ENV_TXKEY);
-	*/
-}
-
-func (db *db) copyfd(handle int) error {
+func (db *DB) copyfd(handle int) error {
 	/*
 			MDB_txn *txn = NULL;
 			int rc;
@@ -953,7 +587,7 @@ func (db *db) copyfd(handle int) error {
 	return nil
 }
 
-func (db *db) Close() {
+func (db *DB) Close() {
 	/*
 		MDB_page *dp;
 
@@ -982,7 +616,7 @@ func (db *db) Close() {
 // @param[in] key The key for the node.
 // @param[in] data The data for the node.
 // @return The number of bytes needed to store the node.
-func (db *db) LeafSize(key []byte, data []byte) int {
+func (db *DB) LeafSize(key []byte, data []byte) int {
 	/*
 		size_t		 sz;
 
@@ -1006,7 +640,7 @@ func (db *db) LeafSize(key []byte, data []byte) int {
 // @param[in] env The environment handle.
 // @param[in] key The key for the node.
 // @return The number of bytes needed to store the node.
-func (db *db) BranchSize(key []byte) int {
+func (db *DB) BranchSize(key []byte) int {
 	/*
 		size_t		 sz;
 
@@ -1022,7 +656,7 @@ func (db *db) BranchSize(key []byte) int {
 	return 0
 }
 
-func (db *db) SetFlags(flag int, onoff bool) error {
+func (db *DB) SetFlags(flag int, onoff bool) error {
 	/*
 		if ((flag & CHANGEABLE) != flag)
 			return EINVAL;
@@ -1035,11 +669,7 @@ func (db *db) SetFlags(flag int, onoff bool) error {
 	return nil
 }
 
-func (db *db) Flags() int {
-	return db.flags
-}
-
-func (db *db) Stat() *Stat {
+func (db *DB) Stat() *Stat {
 	/*
 		int toggle;
 
@@ -1058,9 +688,10 @@ func (db *db) Stat() *Stat {
 		//return mdb_stat0(env, &env->me_metas[toggle]->mm_dbs[MAIN_DBI], stat);
 		return stat
 	*/
+	return nil
 }
 
-func (db *db) Info() *Info {
+func (db *DB) Info() *Info {
 	/*
 		int toggle;
 
@@ -1084,7 +715,7 @@ func (db *db) Info() *Info {
 }
 
 // TODO: Move to bucket.go
-func (db *db) CloseBucket(b Bucket) {
+func (db *DB) CloseBucket(b Bucket) {
 	/*
 		char *ptr;
 		if (dbi <= MAIN_DBI || dbi >= env->me_maxdbs)
@@ -1098,7 +729,7 @@ func (db *db) CloseBucket(b Bucket) {
 }
 
 // int mdb_reader_list(MDB_env *env, MDB_msg_func *func, void *ctx)
-func (db *db) getReaderList() error {
+func (db *DB) getReaderList() error {
 	/*
 		unsigned int i, rdrs;
 		MDB_reader *mr;
@@ -1138,7 +769,7 @@ func (db *db) getReaderList() error {
 }
 
 // (bool return is whether reader is dead)
-func (db *db) checkReaders() (bool, error) {
+func (db *DB) checkReaders() (bool, error) {
 	/*
 		unsigned int i, j, rdrs;
 		MDB_reader *mr;

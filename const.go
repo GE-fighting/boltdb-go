@@ -1,7 +1,6 @@
 package boltdb_go
 
 const Version = 1
-const Magic = 0x83293
 
 const (
 	MaxKeySize  = 511
